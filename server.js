@@ -17,7 +17,7 @@ function fail(res, code, msg, extra) {
 }
 
 async function download(url, destPath) {
-  const resp = await fetch(url);
+  const resp = await fetch(url, { redirect: "follow" });
   if (!resp.ok) throw new Error("download failed " + resp.status + " for " + url);
   const buf = Buffer.from(await resp.arrayBuffer());
   fs.writeFileSync(destPath, buf);
@@ -30,7 +30,7 @@ function runFfmpeg(args) {
     let stderr = "";
     ff.stderr.on("data", (d) => {
       stderr += d.toString();
-      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+      if (stderr.length > 4000) stderr = stderr.slice(-4000);
     });
     ff.on("close", (code) => {
       if (code === 0) resolve();
@@ -51,8 +51,8 @@ app.post("/render", async (req, res) => {
   }
 
   const { audioUrl, coverUrl } = req.body || {};
-  const width = parseInt(req.body?.width, 10) || 1920;
-  const height = parseInt(req.body?.height, 10) || 1080;
+  const width = parseInt(req.body && req.body.width, 10) || 1920;
+  const height = parseInt(req.body && req.body.height, 10) || 1080;
 
   if (!audioUrl || !coverUrl) {
     return fail(res, 400, "audioUrl and coverUrl are required");
@@ -70,20 +70,26 @@ app.post("/render", async (req, res) => {
     await download(coverUrl, coverPath);
 
     console.log("[render " + id + "] rendering " + width + "x" + height);
+    // -framerate 1 on the looped image input so ffmpeg produces frames at the
+    // target rate directly instead of generating 25fps and dropping frames
+    // (which was exhausting memory). -shortest stops at end of audio.
     await runFfmpeg([
       "-y",
       "-loop", "1",
+      "-framerate", "1",
       "-i", coverPath,
       "-i", audioPath,
       "-c:v", "libx264",
+      "-preset", "ultrafast",
       "-tune", "stillimage",
       "-pix_fmt", "yuv420p",
       "-vf",
-      "scale=" + width + ":" + height + ":force_original_aspect_ratio=decrease,pad=" + width + ":" + height + ":(ow-iw)/2:(oh-ih)/2,setsar=1",
-      "-r", "2",
+      "scale=" + width + ":" + height + ":force_original_aspect_ratio=decrease,pad=" + width + ":" + height + ":(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
+      "-r", "1",
       "-c:a", "aac",
       "-b:a", "192k",
       "-shortest",
+      "-fflags", "+shortest",
       "-movflags", "+faststart",
       outPath,
     ]);
