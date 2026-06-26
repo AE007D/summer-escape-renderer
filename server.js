@@ -1,119 +1,144 @@
-const express = require("express");
-const { spawn } = require("child_process");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const crypto = require("crypto");
+// Summer Escape renderer v2 — drop-in replacement for /render
+// Input  (JSON): { audioBase64List: [b64, b64, ...], coverBase64, width, height, seconds, crossfade }
+//   (also still accepts a single audioBase64 for backward compatibility)
+// Output: an MP4 file (binary) — same as before, so n8n keeps piping it straight to YouTube.
+//
+// What's new:
+//  - Uses ALL tracks you drop, stitched in order.
+//  - ~3s CROSSFADE at every join (track->track AND every loop wrap) => no audible gaps/cuts.
+//  - Loops the sequence only as much as needed to reach `seconds`, then trims + fades out.
+//  - Cover is scaled to FILL the whole frame (cover-crop), so it's full screen, no bars.
+
+const express = require('express');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
+const path = require('path');
 
 const app = express();
-// Big limit: a base64 30-min MP3 can be ~10-15 MB -> ~20 MB encoded
-app.use(express.json({ limit: "80mb" }));
+app.use(express.json({ limit: '300mb' }));
 
-const PORT = process.env.PORT || 8080;
-const RENDER_TOKEN = process.env.RENDER_TOKEN || "";
-const TARGET_SECONDS = 30 * 60; // 30 minutes
-
-function fail(res, code, msg, extra) {
-  console.error("[render] " + code + " " + msg, extra || "");
-  if (!res.headersSent) res.status(code).json({ error: msg, ...(extra ? { detail: extra } : {}) });
-}
-
-function checkAuth(req) {
-  if (!RENDER_TOKEN) return true;
-  return (req.headers.authorization || "") === "Bearer " + RENDER_TOKEN;
-}
-
-async function downloadTo(url, destPath) {
-  const resp = await fetch(url, { redirect: "follow" });
-  if (!resp.ok) throw new Error("download failed " + resp.status + " for " + url);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(destPath, buf);
-  return destPath;
-}
-
-function writeB64(b64, destPath) {
-  const clean = String(b64).replace(/^data:[^;]+;base64,/, "");
-  fs.writeFileSync(destPath, Buffer.from(clean, "base64"));
-  return destPath;
-}
-
-function runFfmpeg(args) {
+function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    ff.stderr.on("data", (d) => {
-      stderr += d.toString();
-      if (stderr.length > 4000) stderr = stderr.slice(-4000);
-    });
-    ff.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error("ffmpeg exited " + code + "\n" + stderr));
-    });
-    ff.on("error", reject);
+    const p = spawn(cmd, args);
+    let err = '';
+    p.stderr.on('data', (d) => { err += d.toString(); });
+    p.on('error', reject);
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} failed (${code}): ${err.slice(-1500)}`))));
   });
 }
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+function ffprobeDuration(file) {
+  return new Promise((resolve) => {
+    const p = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file]);
+    let out = '';
+    p.stdout.on('data', (d) => { out += d.toString(); });
+    p.on('error', () => resolve(0));
+    p.on('close', () => {
+      const d = parseFloat(out.trim());
+      resolve(isFinite(d) && d > 0 ? d : 0);
+    });
+  });
+}
 
-app.post("/render", async (req, res) => {
-  if (!checkAuth(req)) return fail(res, 401, "unauthorized");
+app.get('/', (_req, res) => res.json({ ok: true, service: 'summer-escape-renderer-v2' }));
 
+app.post('/render', async (req, res) => {
   const body = req.body || {};
   const width = parseInt(body.width, 10) || 1920;
   const height = parseInt(body.height, 10) || 1080;
-  const loop = String(body.loop) !== "false";
-  const seconds = parseInt(body.seconds, 10) || TARGET_SECONDS;
+  const seconds = parseInt(body.seconds, 10) || 1800;
+  const XF = Math.max(0.5, parseFloat(body.crossfade) || 3);
 
-  const id = crypto.randomBytes(6).toString("hex");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "render-" + id + "-"));
-  const audioPath = path.join(dir, "audio.mp3");
-  const coverPath = path.join(dir, "cover.img");
-  const outPath = path.join(dir, "out.mp4");
+  let list = body.audioBase64List;
+  if (!Array.isArray(list) || list.length === 0) {
+    list = body.audioBase64 ? [body.audioBase64] : null;
+  }
+  if (!list) return res.status(400).json({ status: 'error', message: 'No audio provided' });
+  if (!body.coverBase64) return res.status(400).json({ status: 'error', message: 'No cover provided' });
 
+  const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'render-'));
   try {
-    if (body.audioBase64) writeB64(body.audioBase64, audioPath);
-    else if (body.audioUrl) await downloadTo(body.audioUrl, audioPath);
-    else return fail(res, 400, "audio required (audioBase64 or audioUrl)");
+    // write each unique track + the cover
+    const trackFiles = [];
+    for (let i = 0; i < list.length; i++) {
+      const f = path.join(work, `track_${i}.mp3`);
+      await fsp.writeFile(f, Buffer.from(list[i], 'base64'));
+      trackFiles.push(f);
+    }
+    const cover = path.join(work, 'cover.png');
+    await fsp.writeFile(cover, Buffer.from(body.coverBase64, 'base64'));
 
-    if (body.coverBase64) writeB64(body.coverBase64, coverPath);
-    else if (body.coverUrl) await downloadTo(body.coverUrl, coverPath);
-    else return fail(res, 400, "cover required (coverBase64 or coverUrl)");
+    const durations = [];
+    for (const f of trackFiles) durations.push(await ffprobeDuration(f));
 
-    console.log("[render " + id + "] " + width + "x" + height + " loop=" + loop + " seconds=" + seconds);
+    // Build a play sequence by cycling through the tracks until it covers `seconds`.
+    // Crossfade overlap shortens the total, so we account for it and add a small buffer.
+    const target = seconds + XF + 2;
+    const seq = [];
+    let effective = 0;
+    let k = 0;
+    while (effective < target) {
+      const idx = k % trackFiles.length;
+      const dur = durations[idx] || 180;
+      effective += seq.length === 0 ? dur : Math.max(0.2, dur - XF);
+      seq.push(idx);
+      k++;
+      if (seq.length > 600) break; // hard safety cap
+    }
 
-    const args = ["-y", "-loop", "1", "-framerate", "1", "-i", coverPath];
-    if (loop) args.push("-stream_loop", "-1");
-    args.push(
-      "-i", audioPath,
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-tune", "stillimage",
-      "-pix_fmt", "yuv420p",
-      "-vf", "scale=" + width + ":" + height + ":force_original_aspect_ratio=decrease,pad=" + width + ":" + height + ":(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
-      "-r", "1",
-      "-c:a", "aac",
-      "-b:a", "192k",
-      "-t", String(seconds),
-      "-movflags", "+faststart",
-      outPath
-    );
+    // inputs: each segment (repeats allowed), then the cover image last
+    const inArgs = [];
+    seq.forEach((idx) => { inArgs.push('-i', trackFiles[idx]); });
+    inArgs.push('-loop', '1', '-i', cover);
+    const coverIdx = seq.length;
 
-    await runFfmpeg(args);
+    // normalize every audio input so acrossfade never chokes on mismatched formats
+    let filter = '';
+    seq.forEach((_, i) => {
+      filter += `[${i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[n${i}];`;
+    });
 
-    const stat = fs.statSync(outPath);
-    console.log("[render " + id + "] done, " + (stat.size / 1e6).toFixed(1) + " MB");
+    // crossfade-chain all segments -> [mix]
+    if (seq.length === 1) {
+      filter += `[n0]anull[mix];`;
+    } else {
+      let prev = 'n0';
+      for (let i = 1; i < seq.length; i++) {
+        const out = i === seq.length - 1 ? 'mix' : `x${i}`;
+        filter += `[${prev}][n${i}]acrossfade=d=${XF}:c1=tri:c2=tri[${out}];`;
+        prev = out;
+      }
+    }
 
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", stat.size);
-    res.setHeader("Content-Disposition", 'attachment; filename="render-' + id + '.mp4"');
+    const fadeOutStart = Math.max(0, seconds - 4);
+    filter += `[mix]afade=t=in:st=0:d=2,afade=t=out:st=${fadeOutStart}:d=4,atrim=0:${seconds},asetpts=N/SR/TB[aout];`;
+    filter += `[${coverIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,fps=2,format=yuv420p[vout]`;
 
-    const stream = fs.createReadStream(outPath);
+    const out = path.join(work, 'final.mp4');
+    await run('ffmpeg', [
+      '-y', ...inArgs,
+      '-filter_complex', filter,
+      '-map', '[vout]', '-map', '[aout]',
+      '-c:v', 'libx264', '-tune', 'stillimage', '-preset', 'veryfast',
+      '-c:a', 'aac', '-b:a', '192k',
+      '-t', String(seconds),
+      '-movflags', '+faststart',
+      out,
+    ]);
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="render.mp4"');
+    const stream = fs.createReadStream(out);
     stream.pipe(res);
-    stream.on("close", () => fs.rm(dir, { recursive: true, force: true }, () => {}));
+    stream.on('close', () => { fsp.rm(work, { recursive: true, force: true }).catch(() => {}); });
   } catch (err) {
-    fs.rm(dir, { recursive: true, force: true }, () => {});
-    return fail(res, 500, "render failed", String(err.message || err));
+    console.error(err);
+    fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+    res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-app.listen(PORT, () => console.log("renderer listening on :" + PORT));
+const port = process.env.PORT || 8080;
+app.listen(port, () => console.log('renderer v2 listening on ' + port));
