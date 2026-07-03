@@ -1,3 +1,154 @@
+// Summer Escape renderer v3 — memory-safe, seamless, full-screen
+// Input  (JSON): { audioBase64List: [b64,...], coverBase64, width, height, seconds, crossfade }
+//   (also still accepts a single audioBase64)
+// Output: an MP4 file (binary) — n8n pipes it straight to YouTube.
+//
+// Why v3: v2 fed ffmpeg ~10+ audio inputs at once to fill 30 min and ran the
+// container out of memory. v3 instead:
+//   1) crossfades the (few) unique tracks ONCE into a mix file,
+//   2) turns that mix into a seamless-looping clip (its end crossfades into its
+//      start), then
+//   3) stream-loops that single clip to fill `seconds` — one audio input, so
+//      memory stays flat no matter how long the video is.
+
+const express = require('express');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
+const path = require('path');
+
+const app = express();
+app.use(express.json({ limit: '300mb' }));
+
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args);
+    let err = '';
+    p.stderr.on('data', (d) => { err += d.toString(); if (err.length > 6000) err = err.slice(-6000); });
+    p.on('error', reject);
+    p.on('close', (code, signal) => {
+      if (code === 0) return resolve();
+      reject(new Error(`${cmd} exited code=${code} signal=${signal} :: ${err.slice(-1200)}`));
+    });
+  });
+}
+
+function ffprobeDuration(file) {
+  return new Promise((resolve) => {
+    const p = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file]);
+    let out = '';
+    p.stdout.on('data', (d) => { out += d.toString(); });
+    p.on('error', () => resolve(0));
+    p.on('close', () => {
+      const d = parseFloat(out.trim());
+      resolve(isFinite(d) && d > 0 ? d : 0);
+    });
+  });
+}
+
+app.get('/', (_req, res) => res.json({ ok: true, service: 'summer-escape-renderer-v3' }));
+
+app.post('/render', async (req, res) => {
+  const body = req.body || {};
+  const width = parseInt(body.width, 10) || 1920;
+  const height = parseInt(body.height, 10) || 1080;
+  const seconds = parseInt(body.seconds, 10) || 1800;
+  const XF = Math.max(0.5, parseFloat(body.crossfade) || 3);
+
+  let list = body.audioBase64List;
+  if (!Array.isArray(list) || list.length === 0) list = body.audioBase64 ? [body.audioBase64] : null;
+  if (!list) return res.status(400).json({ status: 'error', message: 'No audio provided' });
+  if (!body.coverBase64) return res.status(400).json({ status: 'error', message: 'No cover provided' });
+
+  const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'render-'));
+  try {
+    const trackFiles = [];
+    for (let i = 0; i < list.length; i++) {
+      const f = path.join(work, `track_${i}.mp3`);
+      await fsp.writeFile(f, Buffer.from(list[i], 'base64'));
+      trackFiles.push(f);
+    }
+    const cover = path.join(work, 'cover.png');
+    await fsp.writeFile(cover, Buffer.from(body.coverBase64, 'base64'));
+
+    // PASS 1: crossfade the unique tracks into one mix.wav
+    const mix = path.join(work, 'mix.wav');
+    if (trackFiles.length === 1) {
+      await run('ffmpeg', ['-y', '-i', trackFiles[0], '-ar', '44100', '-ac', '2', mix]);
+    } else {
+      let filter = '';
+      trackFiles.forEach((_, i) => {
+        filter += `[${i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[n${i}];`;
+      });
+      let prev = 'n0';
+      for (let i = 1; i < trackFiles.length; i++) {
+        const out = i === trackFiles.length - 1 ? 'mix' : `x${i}`;
+        filter += `[${prev}][n${i}]acrossfade=d=${XF}:c1=qsin:c2=qsin[${out}];`;
+        prev = out;
+      }
+      filter = filter.replace(/;$/, '');
+      const inArgs = [];
+      trackFiles.forEach((f) => inArgs.push('-i', f));
+      await run('ffmpeg', ['-y', ...inArgs, '-filter_complex', filter, '-map', '[mix]', '-ar', '44100', '-ac', '2', mix]);
+    }
+
+    const D = await ffprobeDuration(mix);
+
+    let loopSource = mix;
+    let needLoop = false;
+    if (D >= seconds) {
+      needLoop = false;
+    } else if (D > 2 * XF + 1) {
+      // PASS 2: seamless-looping clip whose end crossfades into its start
+      const loopClip = path.join(work, 'loop.wav');
+      const f =
+        `[0:a]atrim=0:${XF},asetpts=N/SR/TB[head];` +
+        `[0:a]atrim=${D - XF}:${D},asetpts=N/SR/TB[tail];` +
+        `[0:a]atrim=${XF}:${D - XF},asetpts=N/SR/TB[mid];` +
+        `[tail][head]acrossfade=d=${XF}:c1=qsin:c2=qsin[join];` +
+        `[mid][join]concat=n=2:v=0:a=1[out]`;
+      await run('ffmpeg', ['-y', '-i', mix, '-filter_complex', f, '-map', '[out]', '-ar', '44100', '-ac', '2', loopClip]);
+      loopSource = loopClip;
+      needLoop = true;
+    } else {
+      needLoop = true;
+    }
+
+    // FINAL PASS: loop one audio source + still cover, fill to `seconds`
+    const out = path.join(work, 'final.mp4');
+    const loopArgs = needLoop ? ['-stream_loop', '-1'] : [];
+    const fadeOutStart = Math.max(0, seconds - 4);
+    const vf =
+      `[1:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,fps=2,format=yuv420p[v];` +
+      `[0:a]afade=t=in:st=0:d=2,afade=t=out:st=${fadeOutStart}:d=4,atrim=0:${seconds},asetpts=N/SR/TB[a]`;
+    await run('ffmpeg', [
+      '-y',
+      ...loopArgs, '-i', loopSource,
+      '-loop', '1', '-i', cover,
+      '-filter_complex', vf,
+      '-map', '[v]', '-map', '[a]',
+      '-c:v', 'libx264', '-tune', 'stillimage', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '192k',
+      '-t', String(seconds),
+      '-movflags', '+faststart',
+      out,
+    ]);
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="render.mp4"');
+    const stream = fs.createReadStream(out);
+    stream.pipe(res);
+    stream.on('close', () => { fsp.rm(work, { recursive: true, force: true }).catch(() => {}); });
+  } catch (err) {
+    console.error(err);
+    fsp.rm(work, { recursive: true, force: true }).catch(() => {});
+    if (!res.headersSent) res.status(500).json({ status: 'error', message: String(err.message || err) });
+  }
+});
+
+const port = process.env.PORT || 8080;
+app.listen(port, () => console.log('renderer v3 listening on ' + port));
 // Summer Escape renderer v3 — memory-flat drop-in replacement for /render
 // Input  (JSON): { audioBase64List: [b64, b64, ...], coverBase64, width, height, seconds, crossfade }
 //   (also still accepts a single audioBase64 for backward compatibility)
